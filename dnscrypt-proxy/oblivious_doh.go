@@ -9,7 +9,7 @@ import (
 )
 
 const (
-	odohVersion    = uint16(0xff06)
+	odohVersion    = uint16(0x0001)
 	maxODoHConfigs = 10
 )
 
