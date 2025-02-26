@@ -16,10 +16,8 @@ func EmptyResponseFromMessage(srcMsg *dns.Msg) *dns.Msg {
 	dstMsg := dns.Msg{MsgHdr: srcMsg.MsgHdr, Compress: true}
 	dstMsg.Question = srcMsg.Question
 	dstMsg.Response = true
-	if srcMsg.RecursionDesired {
-		dstMsg.RecursionAvailable = true
-	}
-	dstMsg.RecursionDesired = false
+	dstMsg.RecursionAvailable = true
+	dstMsg.RecursionDesired = srcMsg.RecursionDesired
 	dstMsg.CheckingDisabled = false
 	dstMsg.AuthenticatedData = false
 	if edns0 := srcMsg.IsEdns0(); edns0 != nil {
@@ -40,6 +38,11 @@ func TruncatedResponse(packet []byte) ([]byte, error) {
 
 func RefusedResponseFromMessage(srcMsg *dns.Msg, refusedCode bool, ipv4 net.IP, ipv6 net.IP, ttl uint32) *dns.Msg {
 	dstMsg := EmptyResponseFromMessage(srcMsg)
+	ede := new(dns.EDNS0_EDE)
+	if edns0 := dstMsg.IsEdns0(); edns0 != nil {
+		edns0.Option = append(edns0.Option, ede)
+	}
+	ede.InfoCode = dns.ExtendedErrorCodeFiltered
 	if refusedCode {
 		dstMsg.Rcode = dns.RcodeRefused
 	} else {
@@ -58,6 +61,7 @@ func RefusedResponseFromMessage(srcMsg *dns.Msg, refusedCode bool, ipv4 net.IP, 
 			if rr.A != nil {
 				dstMsg.Answer = []dns.RR{rr}
 				sendHInfoResponse = false
+				ede.InfoCode = dns.ExtendedErrorCodeForgedAnswer
 			}
 		} else if ipv6 != nil && question.Qtype == dns.TypeAAAA {
 			rr := new(dns.AAAA)
@@ -66,18 +70,24 @@ func RefusedResponseFromMessage(srcMsg *dns.Msg, refusedCode bool, ipv4 net.IP, 
 			if rr.AAAA != nil {
 				dstMsg.Answer = []dns.RR{rr}
 				sendHInfoResponse = false
+				ede.InfoCode = dns.ExtendedErrorCodeForgedAnswer
 			}
 		}
 
 		if sendHInfoResponse {
 			hinfo := new(dns.HINFO)
-			hinfo.Hdr = dns.RR_Header{Name: question.Name, Rrtype: dns.TypeHINFO,
-				Class: dns.ClassINET, Ttl: 1}
+			hinfo.Hdr = dns.RR_Header{
+				Name: question.Name, Rrtype: dns.TypeHINFO,
+				Class: dns.ClassINET, Ttl: ttl,
+			}
 			hinfo.Cpu = "This query has been locally blocked"
 			hinfo.Os = "by dnscrypt-proxy"
 			dstMsg.Answer = []dns.RR{hinfo}
+		} else {
+			ede.ExtraText = "This query has been locally blocked by dnscrypt-proxy"
 		}
 	}
+
 	return dstMsg
 }
 
@@ -135,7 +145,8 @@ func NormalizeQName(str string) (string, error) {
 }
 
 func getMinTTL(msg *dns.Msg, minTTL uint32, maxTTL uint32, cacheNegMinTTL uint32, cacheNegMaxTTL uint32) time.Duration {
-	if (msg.Rcode != dns.RcodeSuccess && msg.Rcode != dns.RcodeNameError) || (len(msg.Answer) <= 0 && len(msg.Ns) <= 0) {
+	if (msg.Rcode != dns.RcodeSuccess && msg.Rcode != dns.RcodeNameError) ||
+		(len(msg.Answer) <= 0 && len(msg.Ns) <= 0) {
 		return time.Duration(cacheNegMinTTL) * time.Second
 	}
 	var ttl uint32
@@ -196,6 +207,9 @@ func updateTTL(msg *dns.Msg, expiration time.Time) {
 	ttl := uint32(0)
 	if until > 0 {
 		ttl = uint32(until / time.Second)
+		if until-time.Duration(ttl)*time.Second >= time.Second/2 {
+			ttl += 1
+		}
 	}
 	for _, rr := range msg.Answer {
 		rr.Header().Ttl = ttl
@@ -258,8 +272,6 @@ func removeEDNS0Options(msg *dns.Msg) bool {
 	return true
 }
 
-func isDigit(b byte) bool { return b >= '0' && b <= '9' }
-
 func dddToByte(s []byte) byte {
 	return byte((s[0]-'0')*100 + (s[1]-'0')*10 + (s[2] - '0'))
 }
@@ -301,44 +313,53 @@ type DNSExchangeResponse struct {
 	err              error
 }
 
-func DNSExchange(proxy *Proxy, proto string, query *dns.Msg, serverAddress string, relay *DNSCryptRelay, serverName *string, tryFragmentsSupport bool) (*dns.Msg, time.Duration, bool, error) {
+func DNSExchange(
+	proxy *Proxy,
+	proto string,
+	query *dns.Msg,
+	serverAddress string,
+	relay *DNSCryptRelay,
+	serverName *string,
+	tryFragmentsSupport bool,
+) (*dns.Msg, time.Duration, bool, error) {
 	for {
 		cancelChannel := make(chan struct{})
-		channel := make(chan DNSExchangeResponse)
+		maxTries := 3
+		channel := make(chan DNSExchangeResponse, 2*maxTries)
 		var err error
 		options := 0
 
-		for tries := 0; tries < 3; tries++ {
+		for tries := 0; tries < maxTries; tries++ {
 			if tryFragmentsSupport {
 				queryCopy := query.Copy()
 				queryCopy.Id += uint16(options)
 				go func(query *dns.Msg, delay time.Duration) {
-					option := _dnsExchange(proxy, proto, query, serverAddress, relay, 1500)
+					time.Sleep(delay)
+					option := DNSExchangeResponse{err: errors.New("Canceled")}
+					select {
+					case <-cancelChannel:
+					default:
+						option = _dnsExchange(proxy, proto, query, serverAddress, relay, 1500)
+					}
 					option.fragmentsBlocked = false
 					option.priority = 0
 					channel <- option
-					time.Sleep(delay)
-					select {
-					case <-cancelChannel:
-						return
-					default:
-					}
 				}(queryCopy, time.Duration(200*tries)*time.Millisecond)
 				options++
 			}
 			queryCopy := query.Copy()
 			queryCopy.Id += uint16(options)
 			go func(query *dns.Msg, delay time.Duration) {
-				option := _dnsExchange(proxy, proto, query, serverAddress, relay, 480)
+				time.Sleep(delay)
+				option := DNSExchangeResponse{err: errors.New("Canceled")}
+				select {
+				case <-cancelChannel:
+				default:
+					option = _dnsExchange(proxy, proto, query, serverAddress, relay, 480)
+				}
 				option.fragmentsBlocked = true
 				option.priority = 1
 				channel <- option
-				time.Sleep(delay)
-				select {
-				case <-cancelChannel:
-					return
-				default:
-				}
 			}(queryCopy, time.Duration(250*tries)*time.Millisecond)
 			options++
 		}
@@ -372,12 +393,23 @@ func DNSExchange(proxy *Proxy, proto string, query *dns.Msg, serverAddress strin
 			}
 			return nil, 0, false, err
 		}
-		dlog.Infof("Unable to get the public key for [%v] via relay [%v], retrying over a direct connection", *serverName, relay.RelayUDPAddr.IP)
+		dlog.Infof(
+			"Unable to get the public key for [%v] via relay [%v], retrying over a direct connection",
+			*serverName,
+			relay.RelayUDPAddr.IP,
+		)
 		relay = nil
 	}
 }
 
-func _dnsExchange(proxy *Proxy, proto string, query *dns.Msg, serverAddress string, relay *DNSCryptRelay, paddedLen int) DNSExchangeResponse {
+func _dnsExchange(
+	proxy *Proxy,
+	proto string,
+	query *dns.Msg,
+	serverAddress string,
+	relay *DNSCryptRelay,
+	paddedLen int,
+) DNSExchangeResponse {
 	var packet []byte
 	var rtt time.Duration
 

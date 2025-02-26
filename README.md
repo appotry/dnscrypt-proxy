@@ -2,14 +2,11 @@
 
 [![Financial Contributors on Open Collective](https://opencollective.com/dnscrypt/all/badge.svg?label=financial+contributors)](https://opencollective.com/dnscrypt)
 [![DNSCrypt-Proxy Release](https://img.shields.io/github/release/dnscrypt/dnscrypt-proxy.svg?label=Latest%20Release&style=popout)](https://github.com/dnscrypt/dnscrypt-proxy/releases/latest)
-[![Build Status](https://github.com/DNSCrypt/dnscrypt-proxy/workflows/CI%20and%20optionally%20publish/badge.svg)](https://github.com/DNSCrypt/dnscrypt-proxy/actions)
-![CodeQL scan](https://github.com/DNSCrypt/dnscrypt-proxy/workflows/CodeQL%20scan/badge.svg)
-![ShiftLeft Scan](https://github.com/DNSCrypt/dnscrypt-proxy/workflows/ShiftLeft%20Scan/badge.svg)
-[![#dnscrypt-proxy:matrix.org](https://img.shields.io/matrix/dnscrypt-proxy:matrix.org.svg?label=DNSCrypt-Proxy%20Matrix%20Chat&server_fqdn=matrix.org&style=popout)](https://matrix.to/#/#dnscrypt-proxy:matrix.org)
+[![Build Status](https://github.com/DNSCrypt/dnscrypt-proxy/actions/workflows/releases.yml/badge.svg)](https://github.com/DNSCrypt/dnscrypt-proxy/actions/workflows/releases.yml)
 
 ## Overview
 
-A flexible DNS proxy, with support for modern encrypted DNS protocols such as [DNSCrypt v2](https://dnscrypt.info/protocol), [DNS-over-HTTPS](https://www.rfc-editor.org/rfc/rfc8484.txt), [Anonymized DNSCrypt](https://github.com/DNSCrypt/dnscrypt-protocol/blob/master/ANONYMIZED-DNSCRYPT.txt) and [ODoH (Oblivious DoH)](https://github.com/DNSCrypt/dnscrypt-resolvers/blob/master/v3/odoh.md).
+A flexible DNS proxy, with support for modern encrypted DNS protocols such as [DNSCrypt v2](https://dnscrypt.info/protocol), [DNS-over-HTTPS](https://www.rfc-editor.org/rfc/rfc8484.txt), [Anonymized DNSCrypt](https://github.com/DNSCrypt/dnscrypt-protocol/blob/master/ANONYMIZED-DNSCRYPT.txt) and [ODoH (Oblivious DoH)](https://github.com/DNSCrypt/dnscrypt-resolvers/blob/master/v3/odoh-servers.md).
 
 * **[dnscrypt-proxy documentation](https://dnscrypt.info/doc) ← Start here**
 * [DNSCrypt project home page](https://dnscrypt.info/)
@@ -25,7 +22,7 @@ Available as source code and pre-built binaries for most operating systems and a
 
 ## Features
 
-* DNS traffic encryption and authentication. Supports DNS-over-HTTPS (DoH) using TLS 1.3, DNSCrypt, Anonymized DNS and ODoH
+* DNS traffic encryption and authentication. Supports DNS-over-HTTPS (DoH) using TLS 1.3 and QUIC, DNSCrypt, Anonymized DNS and ODoH
 * Client IP addresses can be hidden using Tor, SOCKS proxies or Anonymized DNS relays
 * DNS query monitoring, with separate log files for regular and suspicious queries
 * Filtering: block ads, malware, and other unwanted content. Compatible with all DNS services
@@ -38,7 +35,7 @@ Available as source code and pre-built binaries for most operating systems and a
 * Automatic background updates of resolvers lists
 * Can force outgoing connections to use TCP
 * Compatible with DNSSEC
-* Includes a local DoH server in order to support ECHO (ESNI)
+* Includes a local DoH server in order to support ECH (ESNI)
 
 ## Pre-built binaries
 
@@ -60,13 +57,15 @@ Up-to-date, pre-built binaries are available for:
 * Linux/mips64le
 * Linux/x86
 * Linux/x86_64
-* MacOS X
+* macOS/arm64
+* macOS/x86_64
 * NetBSD/x86
 * NetBSD/x86_64
 * OpenBSD/x86
 * OpenBSD/x86_64
 * Windows
 * Windows 64 bit
+* Windows ARM
 
 How to use these files, as well as how to verify their signatures, are documented in the [installation instructions](https://github.com/dnscrypt/dnscrypt-proxy/wiki/installation).
 
@@ -74,7 +73,7 @@ How to use these files, as well as how to verify their signatures, are documente
 
 ### Code Contributors
 
-This project exists thanks to all the people who contribute. [[Contribute](CONTRIBUTING.md)].
+This project exists thanks to all the people who contribute.
 <a href="https://github.com/dnscrypt/dnscrypt-proxy/graphs/contributors"><img src="https://opencollective.com/dnscrypt/contributors.svg?width=890&button=false" /></a>
 
 ### Financial Contributors

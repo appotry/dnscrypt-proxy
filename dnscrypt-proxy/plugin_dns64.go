@@ -34,19 +34,22 @@ func (plugin *PluginDNS64) Description() string {
 }
 
 func (plugin *PluginDNS64) Init(proxy *Proxy) error {
-	plugin.ipv4Resolver = proxy.listenAddresses[0] //recursively to ourselves
+	if len(proxy.listenAddresses) == 0 {
+		return errors.New("At least one listening IP address must be configured for the DNS64 plugin to work")
+	}
+	plugin.ipv4Resolver = proxy.listenAddresses[0] // query is sent to ourselves
 	plugin.pref64Mutex = new(sync.RWMutex)
 	plugin.proxy = proxy
 
 	if len(proxy.dns64Prefixes) != 0 {
-		plugin.pref64Mutex.RLock()
-		defer plugin.pref64Mutex.RUnlock()
+		plugin.pref64Mutex.Lock()
+		defer plugin.pref64Mutex.Unlock()
 		for _, prefStr := range proxy.dns64Prefixes {
 			_, pref, err := net.ParseCIDR(prefStr)
 			if err != nil {
 				return err
 			}
-			dlog.Infof("Registered DNS64 prefix [%s]", pref.String())
+			dlog.Noticef("Registered DNS64 prefix [%s]", pref.String())
 			plugin.pref64 = append(plugin.pref64, pref)
 		}
 	} else if len(proxy.dns64Resolvers) != 0 {
@@ -54,7 +57,10 @@ func (plugin *PluginDNS64) Init(proxy *Proxy) error {
 		if err := plugin.refreshPref64(); err != nil {
 			return err
 		}
+	} else {
+		return nil
 	}
+	dlog.Notice("DNS64 map enabled")
 
 	return nil
 }
@@ -87,14 +93,22 @@ func (plugin *PluginDNS64) Eval(pluginsState *PluginsState, msg *dns.Msg) error 
 	if !plugin.proxy.clientsCountInc() {
 		return errors.New("Too many concurrent connections to handle DNS64 subqueries")
 	}
-	respPacket := plugin.proxy.processIncomingQuery("trampoline", plugin.proxy.mainProto, msgAPacket, nil, nil, time.Now())
+	respPacket := plugin.proxy.processIncomingQuery(
+		"trampoline",
+		plugin.proxy.mainProto,
+		msgAPacket,
+		nil,
+		nil,
+		time.Now(),
+		false,
+	)
 	plugin.proxy.clientsCountDec()
 	resp := dns.Msg{}
 	if err := resp.Unpack(respPacket); err != nil {
 		return err
 	}
 
-	if err != nil || resp.Rcode != dns.RcodeSuccess {
+	if resp.Rcode != dns.RcodeSuccess {
 		return nil
 	}
 
@@ -110,10 +124,12 @@ func (plugin *PluginDNS64) Eval(pluginsState *PluginsState, msg *dns.Msg) error 
 		}
 	}
 
-	synthAAAAs := make([]dns.RR, 0)
+	synth64 := make([]dns.RR, 0)
 	for _, answer := range resp.Answer {
 		header := answer.Header()
-		if header.Rrtype == dns.TypeA {
+		if header.Rrtype == dns.TypeCNAME {
+			synth64 = append(synth64, answer)
+		} else if header.Rrtype == dns.TypeA {
 			ttl := initialTTL
 			if ttl > header.Ttl {
 				ttl = header.Ttl
@@ -121,24 +137,28 @@ func (plugin *PluginDNS64) Eval(pluginsState *PluginsState, msg *dns.Msg) error 
 
 			ipv4 := answer.(*dns.A).A.To4()
 			if ipv4 != nil {
-				plugin.pref64Mutex.Lock()
+				plugin.pref64Mutex.RLock()
 				for _, prefix := range plugin.pref64 {
 					ipv6 := translateToIPv6(ipv4, prefix)
 					synthAAAA := new(dns.AAAA)
-					synthAAAA.Hdr = dns.RR_Header{Name: header.Name, Rrtype: dns.TypeAAAA, Class: header.Class, Ttl: ttl}
+					synthAAAA.Hdr = dns.RR_Header{
+						Name:   header.Name,
+						Rrtype: dns.TypeAAAA,
+						Class:  header.Class,
+						Ttl:    ttl,
+					}
 					synthAAAA.AAAA = ipv6
-					synthAAAAs = append(synthAAAAs, synthAAAA)
+					synth64 = append(synth64, synthAAAA)
 				}
-				plugin.pref64Mutex.Unlock()
+				plugin.pref64Mutex.RUnlock()
 			}
 		}
 	}
 
-	synth := EmptyResponseFromMessage(msg)
-	synth.Answer = append(synth.Answer, synthAAAAs...)
+	msg.Answer = synth64
+	msg.AuthenticatedData = false
+	msg.SetEdns0(uint16(MaxDNSUDPSafePacketSize), false)
 
-	pluginsState.synthResponse = synth
-	pluginsState.action = PluginsActionSynth
 	pluginsState.returnCode = PluginsReturnCodeCloak
 
 	return nil
@@ -173,7 +193,6 @@ func (plugin *PluginDNS64) fetchPref64(resolver string) error {
 
 	client := new(dns.Client)
 	resp, _, err := client.Exchange(msg, resolver)
-
 	if err != nil {
 		return err
 	}
@@ -190,17 +209,18 @@ func (plugin *PluginDNS64) fetchPref64(resolver string) error {
 			if ipv6 != nil && len(ipv6) == net.IPv6len {
 				prefEnd := 0
 
-				if wka := net.IPv4(ipv6[12], ipv6[13], ipv6[14], ipv6[15]); wka.Equal(rfc7050WKA1) || wka.Equal(rfc7050WKA2) { //96
+				if wka := net.IPv4(ipv6[12], ipv6[13], ipv6[14], ipv6[15]); wka.Equal(rfc7050WKA1) ||
+					wka.Equal(rfc7050WKA2) { // 96
 					prefEnd = 12
-				} else if wka := net.IPv4(ipv6[9], ipv6[10], ipv6[11], ipv6[12]); wka.Equal(rfc7050WKA1) || wka.Equal(rfc7050WKA2) { //64
+				} else if wka := net.IPv4(ipv6[9], ipv6[10], ipv6[11], ipv6[12]); wka.Equal(rfc7050WKA1) || wka.Equal(rfc7050WKA2) { // 64
 					prefEnd = 8
-				} else if wka := net.IPv4(ipv6[7], ipv6[9], ipv6[10], ipv6[11]); wka.Equal(rfc7050WKA1) || wka.Equal(rfc7050WKA2) { //56
+				} else if wka := net.IPv4(ipv6[7], ipv6[9], ipv6[10], ipv6[11]); wka.Equal(rfc7050WKA1) || wka.Equal(rfc7050WKA2) { // 56
 					prefEnd = 7
-				} else if wka := net.IPv4(ipv6[6], ipv6[7], ipv6[9], ipv6[10]); wka.Equal(rfc7050WKA1) || wka.Equal(rfc7050WKA2) { //48
+				} else if wka := net.IPv4(ipv6[6], ipv6[7], ipv6[9], ipv6[10]); wka.Equal(rfc7050WKA1) || wka.Equal(rfc7050WKA2) { // 48
 					prefEnd = 6
-				} else if wka := net.IPv4(ipv6[5], ipv6[6], ipv6[7], ipv6[9]); wka.Equal(rfc7050WKA1) || wka.Equal(rfc7050WKA2) { //40
+				} else if wka := net.IPv4(ipv6[5], ipv6[6], ipv6[7], ipv6[9]); wka.Equal(rfc7050WKA1) || wka.Equal(rfc7050WKA2) { // 40
 					prefEnd = 5
-				} else if wka := net.IPv4(ipv6[4], ipv6[5], ipv6[6], ipv6[7]); wka.Equal(rfc7050WKA1) || wka.Equal(rfc7050WKA2) { //32
+				} else if wka := net.IPv4(ipv6[4], ipv6[5], ipv6[6], ipv6[7]); wka.Equal(rfc7050WKA1) || wka.Equal(rfc7050WKA2) { // 32
 					prefEnd = 4
 				}
 
@@ -222,8 +242,8 @@ func (plugin *PluginDNS64) fetchPref64(resolver string) error {
 		return errors.New("Empty Pref64 list")
 	}
 
-	plugin.pref64Mutex.RLock()
-	defer plugin.pref64Mutex.RUnlock()
+	plugin.pref64Mutex.Lock()
+	defer plugin.pref64Mutex.Unlock()
 	plugin.pref64 = prefixes
 	return nil
 }
@@ -235,8 +255,8 @@ func (plugin *PluginDNS64) refreshPref64() error {
 		}
 	}
 
-	plugin.pref64Mutex.Lock()
-	defer plugin.pref64Mutex.Unlock()
+	plugin.pref64Mutex.RLock()
+	defer plugin.pref64Mutex.RUnlock()
 	if len(plugin.pref64) == 0 {
 		return errors.New("Empty Pref64 list")
 	}

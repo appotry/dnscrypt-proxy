@@ -67,6 +67,7 @@ type ServerInfo struct {
 
 type LBStrategy interface {
 	getCandidate(serversCount int) int
+	getActiveCount(serversCount int) int
 }
 
 type LBStrategyP2 struct{}
@@ -75,10 +76,18 @@ func (LBStrategyP2) getCandidate(serversCount int) int {
 	return rand.Intn(Min(serversCount, 2))
 }
 
+func (LBStrategyP2) getActiveCount(serversCount int) int {
+	return Min(serversCount, 2)
+}
+
 type LBStrategyPN struct{ n int }
 
 func (s LBStrategyPN) getCandidate(serversCount int) int {
 	return rand.Intn(Min(serversCount, s.n))
+}
+
+func (s LBStrategyPN) getActiveCount(serversCount int) int {
+	return Min(serversCount, s.n)
 }
 
 type LBStrategyPH struct{}
@@ -87,16 +96,28 @@ func (LBStrategyPH) getCandidate(serversCount int) int {
 	return rand.Intn(Max(Min(serversCount, 2), serversCount/2))
 }
 
+func (LBStrategyPH) getActiveCount(serversCount int) int {
+	return Max(Min(serversCount, 2), serversCount/2)
+}
+
 type LBStrategyFirst struct{}
 
 func (LBStrategyFirst) getCandidate(int) int {
 	return 0
 }
 
+func (LBStrategyFirst) getActiveCount(int) int {
+	return 1
+}
+
 type LBStrategyRandom struct{}
 
 func (LBStrategyRandom) getCandidate(serversCount int) int {
 	return rand.Intn(serversCount)
+}
+
+func (LBStrategyRandom) getActiveCount(serversCount int) int {
+	return serversCount
 }
 
 var DefaultLBStrategy = LBStrategyP2{}
@@ -126,7 +147,12 @@ type ServersInfo struct {
 }
 
 func NewServersInfo() ServersInfo {
-	return ServersInfo{lbStrategy: DefaultLBStrategy, lbEstimator: true, registeredServers: make([]RegisteredServer, 0), registeredRelays: make([]RegisteredServer, 0)}
+	return ServersInfo{
+		lbStrategy:        DefaultLBStrategy,
+		lbEstimator:       true,
+		registeredServers: make([]RegisteredServer, 0),
+		registeredRelays:  make([]RegisteredServer, 0),
+	}
 }
 
 func (serversInfo *ServersInfo) registerServer(name string, stamp stamps.ServerStamp) {
@@ -197,14 +223,34 @@ func (serversInfo *ServersInfo) refreshServer(proxy *Proxy, name string, stamp s
 func (serversInfo *ServersInfo) refresh(proxy *Proxy) (int, error) {
 	dlog.Debug("Refreshing certificates")
 	serversInfo.RLock()
-	registeredServers := serversInfo.registeredServers
+	// Appending registeredServers slice from sources may allocate new memory.
+	serversCount := len(serversInfo.registeredServers)
+	registeredServers := make([]RegisteredServer, serversCount)
+	copy(registeredServers, serversInfo.registeredServers)
 	serversInfo.RUnlock()
+	countChannel := make(chan struct{}, proxy.certRefreshConcurrency)
+	errorChannel := make(chan error, serversCount)
+	for i := range registeredServers {
+		countChannel <- struct{}{}
+		go func(registeredServer *RegisteredServer) {
+			err := serversInfo.refreshServer(proxy, registeredServer.name, registeredServer.stamp)
+			if err == nil {
+				proxy.xTransport.internalResolverReady = true
+			}
+			errorChannel <- err
+			<-countChannel
+		}(&registeredServers[i])
+	}
 	liveServers := 0
 	var err error
-	for _, registeredServer := range registeredServers {
-		if err = serversInfo.refreshServer(proxy, registeredServer.name, registeredServer.stamp); err == nil {
+	for i := 0; i < serversCount; i++ {
+		err = <-errorChannel
+		if err == nil {
 			liveServers++
 		}
+	}
+	if liveServers > 0 {
+		err = nil
 	}
 	serversInfo.Lock()
 	sort.SliceStable(serversInfo.inner, func(i, j int) bool {
@@ -225,31 +271,44 @@ func (serversInfo *ServersInfo) refresh(proxy *Proxy) (int, error) {
 	return liveServers, err
 }
 
-func (serversInfo *ServersInfo) estimatorUpdate() {
+func (serversInfo *ServersInfo) estimatorUpdate(currentActive int) {
 	// serversInfo.RWMutex is assumed to be Locked
-	candidate := rand.Intn(len(serversInfo.inner))
-	if candidate == 0 {
+	serversCount := len(serversInfo.inner)
+	activeCount := serversInfo.lbStrategy.getActiveCount(serversCount)
+	if activeCount == serversCount {
 		return
 	}
-	candidateRtt, currentBestRtt := serversInfo.inner[candidate].rtt.Value(), serversInfo.inner[0].rtt.Value()
-	if currentBestRtt < 0 {
-		currentBestRtt = candidateRtt
-		serversInfo.inner[0].rtt.Set(currentBestRtt)
+	candidate := rand.Intn(serversCount-activeCount) + activeCount
+	candidateRtt, currentActiveRtt := serversInfo.inner[candidate].rtt.Value(), serversInfo.inner[currentActive].rtt.Value()
+	if currentActiveRtt < 0 {
+		currentActiveRtt = candidateRtt
+		serversInfo.inner[currentActive].rtt.Set(currentActiveRtt)
+		return
 	}
 	partialSort := false
-	if candidateRtt < currentBestRtt {
-		serversInfo.inner[candidate], serversInfo.inner[0] = serversInfo.inner[0], serversInfo.inner[candidate]
+	if candidateRtt < currentActiveRtt {
+		serversInfo.inner[candidate], serversInfo.inner[currentActive] = serversInfo.inner[currentActive], serversInfo.inner[candidate]
+		dlog.Debugf(
+			"New preferred candidate: %s (RTT: %d vs previous: %d)",
+			serversInfo.inner[currentActive].Name,
+			int(candidateRtt),
+			int(currentActiveRtt),
+		)
 		partialSort = true
-		dlog.Debugf("New preferred candidate: %v (rtt: %d vs previous: %d)", serversInfo.inner[0].Name, int(candidateRtt), int(currentBestRtt))
-	} else if candidateRtt > 0 && candidateRtt >= currentBestRtt*4.0 {
+	} else if candidateRtt > 0 && candidateRtt >= (serversInfo.inner[0].rtt.Value()+serversInfo.inner[activeCount-1].rtt.Value())/2.0*4.0 {
 		if time.Since(serversInfo.inner[candidate].lastActionTS) > time.Duration(1*time.Minute) {
-			serversInfo.inner[candidate].rtt.Add(MinF(MaxF(candidateRtt/2.0, currentBestRtt*2.0), candidateRtt))
-			dlog.Debugf("Giving a new chance to candidate [%s], lowering its RTT from %d to %d (best: %d)", serversInfo.inner[candidate].Name, int(candidateRtt), int(serversInfo.inner[candidate].rtt.Value()), int(currentBestRtt))
+			serversInfo.inner[candidate].rtt.Add(candidateRtt / 2.0)
+			dlog.Debugf(
+				"Giving a new chance to candidate [%s], lowering its RTT from %d to %d (best: %d)",
+				serversInfo.inner[candidate].Name,
+				int(candidateRtt),
+				int(serversInfo.inner[candidate].rtt.Value()),
+				int(serversInfo.inner[0].rtt.Value()),
+			)
 			partialSort = true
 		}
 	}
 	if partialSort {
-		serversCount := len(serversInfo.inner)
 		for i := 1; i < serversCount; i++ {
 			if serversInfo.inner[i-1].rtt.Value() > serversInfo.inner[i].rtt.Value() {
 				serversInfo.inner[i-1], serversInfo.inner[i] = serversInfo.inner[i], serversInfo.inner[i-1]
@@ -265,12 +324,12 @@ func (serversInfo *ServersInfo) getOne() *ServerInfo {
 		serversInfo.Unlock()
 		return nil
 	}
-	if serversInfo.lbEstimator {
-		serversInfo.estimatorUpdate()
-	}
 	candidate := serversInfo.lbStrategy.getCandidate(serversCount)
+	if serversInfo.lbEstimator {
+		serversInfo.estimatorUpdate(candidate)
+	}
 	serverInfo := serversInfo.inner[candidate]
-	dlog.Debugf("Using candidate [%s] RTT: %d", (*serverInfo).Name, int((*serverInfo).rtt.Value()))
+	dlog.Debugf("Using candidate [%s] RTT: %d", serverInfo.Name, int(serverInfo.rtt.Value()))
 	serversInfo.Unlock()
 
 	return serverInfo
@@ -297,12 +356,13 @@ func findFarthestRoute(proxy *Proxy, name string, relayStamps []stamps.ServerSta
 		}
 	}
 	if serverIdx < 0 {
+		proxy.serversInfo.RUnlock()
 		return nil
 	}
 	server := proxy.serversInfo.registeredServers[serverIdx]
 	proxy.serversInfo.RUnlock()
 
-	// Fall back to random relays until the logic is implementeed for non-DNSCrypt relays
+	// Fall back to random relays until the logic is implemented for non-DNSCrypt relays
 	if server.stamp.Proto == stamps.StampProtoTypeODoHTarget {
 		candidates := make([]int, 0)
 		for relayIdx, relayStamp := range relayStamps {
@@ -316,7 +376,7 @@ func findFarthestRoute(proxy *Proxy, name string, relayStamps []stamps.ServerSta
 		return nil
 	}
 
-	// Anonyimized DNSCrypt relays
+	// Anonymized DNSCrypt relays
 	serverAddrStr, _ := ExtractHostAndPort(server.stamp.ServerAddrStr, 443)
 	serverAddr := net.ParseIP(serverAddrStr)
 	if serverAddr == nil {
@@ -392,16 +452,19 @@ func route(proxy *Proxy, name string, serverProto stamps.StampProtoType) (*Relay
 		return nil, nil
 	}
 	relayStamps := make([]stamps.ServerStamp, 0)
+	relayStampToName := make(map[string]string)
 	for _, relayName := range relayNames {
 		if relayStamp, err := stamps.NewServerStampFromString(relayName); err == nil {
 			if relayStamp.Proto == relayProto {
 				relayStamps = append(relayStamps, relayStamp)
+				relayStampToName[relayStamp.String()] = relayName
 			}
 		} else if relayName == "*" {
 			proxy.serversInfo.RLock()
 			for _, registeredServer := range proxy.serversInfo.registeredRelays {
 				if registeredServer.stamp.Proto == relayProto {
 					relayStamps = append(relayStamps, registeredServer.stamp)
+					relayStampToName[registeredServer.stamp.String()] = registeredServer.name
 				}
 			}
 			proxy.serversInfo.RUnlock()
@@ -412,12 +475,7 @@ func route(proxy *Proxy, name string, serverProto stamps.StampProtoType) (*Relay
 			for _, registeredServer := range proxy.serversInfo.registeredRelays {
 				if registeredServer.name == relayName && registeredServer.stamp.Proto == relayProto {
 					relayStamps = append(relayStamps, registeredServer.stamp)
-					break
-				}
-			}
-			for _, registeredServer := range proxy.serversInfo.registeredServers {
-				if registeredServer.name == relayName && registeredServer.stamp.Proto == relayProto {
-					relayStamps = append(relayStamps, registeredServer.stamp)
+					relayStampToName[registeredServer.stamp.String()] = relayName
 					break
 				}
 			}
@@ -425,8 +483,8 @@ func route(proxy *Proxy, name string, serverProto stamps.StampProtoType) (*Relay
 		}
 	}
 	if len(relayStamps) == 0 {
-		dlog.Warnf("Empty relay set for [%v]", name)
-		return nil, nil
+		err := fmt.Errorf("Non-existent relay set for server [%v]", name)
+		return nil, err
 	}
 	var relayCandidateStamp *stamps.ServerStamp
 	if !wildcard || len(relayStamps) == 1 {
@@ -437,15 +495,7 @@ func route(proxy *Proxy, name string, serverProto stamps.StampProtoType) (*Relay
 	if relayCandidateStamp == nil {
 		return nil, fmt.Errorf("No valid relay for server [%v]", name)
 	}
-	relayName := relayCandidateStamp.ServerAddrStr
-	proxy.serversInfo.RLock()
-	for _, registeredServer := range proxy.serversInfo.registeredRelays {
-		if registeredServer.stamp.ServerAddrStr == relayCandidateStamp.ServerAddrStr {
-			relayName = registeredServer.name
-			break
-		}
-	}
-	proxy.serversInfo.RUnlock()
+	relayName := relayStampToName[relayCandidateStamp.String()]
 	switch relayCandidateStamp.Proto {
 	case stamps.StampProtoTypeDNSCrypt, stamps.StampProtoTypeDNSCryptRelay:
 		relayUDPAddr, err := net.ResolveUDPAddr("udp", relayCandidateStamp.ServerAddrStr)
@@ -457,9 +507,14 @@ func route(proxy *Proxy, name string, serverProto stamps.StampProtoType) (*Relay
 			return nil, err
 		}
 		dlog.Noticef("Anonymizing queries for [%v] via [%v]", name, relayName)
-		return &Relay{Proto: stamps.StampProtoTypeDNSCryptRelay, Dnscrypt: &DNSCryptRelay{RelayUDPAddr: relayUDPAddr, RelayTCPAddr: relayTCPAddr}}, nil
+		return &Relay{
+			Proto:    stamps.StampProtoTypeDNSCryptRelay,
+			Dnscrypt: &DNSCryptRelay{RelayUDPAddr: relayUDPAddr, RelayTCPAddr: relayTCPAddr},
+		}, nil
 	case stamps.StampProtoTypeODoHRelay:
-		relayBaseURL, err := url.Parse("https://" + url.PathEscape(relayCandidateStamp.ProviderName) + relayCandidateStamp.Path)
+		relayBaseURL, err := url.Parse(
+			"https://" + url.PathEscape(relayCandidateStamp.ProviderName) + relayCandidateStamp.Path,
+		)
 		if err != nil {
 			return nil, err
 		}
@@ -482,7 +537,8 @@ func route(proxy *Proxy, name string, serverProto stamps.StampProtoType) (*Relay
 		if len(relayCandidateStamp.ServerAddrStr) > 0 {
 			ipOnly, _ := ExtractHostAndPort(relayCandidateStamp.ServerAddrStr, -1)
 			if ip := ParseIP(ipOnly); ip != nil {
-				proxy.xTransport.saveCachedIP(relayCandidateStamp.ProviderName, ip, -1*time.Second)
+				host, _ := ExtractHostAndPort(relayCandidateStamp.ProviderName, -1)
+				proxy.xTransport.saveCachedIP(host, ip, -1*time.Second)
 			}
 		}
 		dlog.Noticef("Anonymizing queries for [%v] via [%v]", name, relayName)
@@ -495,7 +551,7 @@ func route(proxy *Proxy, name string, serverProto stamps.StampProtoType) (*Relay
 
 func fetchDNSCryptServerInfo(proxy *Proxy, name string, stamp stamps.ServerStamp, isNew bool) (ServerInfo, error) {
 	if len(stamp.ServerPk) != ed25519.PublicKeySize {
-		serverPk, err := hex.DecodeString(strings.Replace(string(stamp.ServerPk), ":", "", -1))
+		serverPk, err := hex.DecodeString(strings.ReplaceAll(string(stamp.ServerPk), ":", ""))
 		if err != nil || len(serverPk) != ed25519.PublicKeySize {
 			dlog.Fatalf("Unsupported public key for [%s]: [%s]", name, stamp.ServerPk)
 		}
@@ -518,7 +574,17 @@ func fetchDNSCryptServerInfo(proxy *Proxy, name string, stamp stamps.ServerStamp
 	if relay != nil {
 		dnscryptRelay = relay.Dnscrypt
 	}
-	certInfo, rtt, fragmentsBlocked, err := FetchCurrentDNSCryptCert(proxy, &name, proxy.mainProto, stamp.ServerPk, stamp.ServerAddrStr, stamp.ProviderName, isNew, dnscryptRelay, knownBugs)
+	certInfo, rtt, fragmentsBlocked, err := FetchCurrentDNSCryptCert(
+		proxy,
+		&name,
+		proxy.mainProto,
+		stamp.ServerPk,
+		stamp.ServerAddrStr,
+		stamp.ProviderName,
+		isNew,
+		dnscryptRelay,
+		knownBugs,
+	)
 	if !knownBugs.fragmentsBlocked && fragmentsBlocked {
 		dlog.Debugf("[%v] drops fragmented queries", name)
 		knownBugs.fragmentsBlocked = true
@@ -542,6 +608,46 @@ func fetchDNSCryptServerInfo(proxy *Proxy, name string, stamp stamps.ServerStamp
 	if err != nil {
 		return ServerInfo{}, err
 	}
+
+	if certInfo.CryptoConstruction == XSalsa20Poly1305 {
+		query := plainNXTestPacket(0xcafe)
+		msg, _, _, err := DNSExchange(
+			proxy,
+			proxy.mainProto,
+			&query,
+			stamp.ServerAddrStr,
+			dnscryptRelay,
+			&name,
+			false,
+		)
+		if err == nil && len(msg.Question) > 0 {
+			question := msg.Question[0]
+			if question.Qtype == query.Question[0].Qtype && strings.EqualFold(question.Name, query.Question[0].Name) {
+				dlog.Debugf("[%s] also serves plaintext DNS", name)
+				if msg.Id != 0xcafe {
+					dlog.Infof("[%s] handling of DNS message identifiers is broken", name)
+				}
+				for _, rr := range msg.Answer {
+					if rr.Header().Rrtype == dns.TypeA || rr.Header().Rrtype == dns.TypeAAAA {
+						dlog.Warnf("[%s] may be a lying resolver -- skipping", name)
+						return ServerInfo{}, fmt.Errorf("[%s] unexpected record: [%s]", name, rr.String())
+					}
+				}
+				for _, rr := range msg.Extra {
+					if rr.Header().Rrtype == dns.TypeTXT {
+						dlog.Warnf("[%s] may be a dummy resolver -- skipping", name)
+						txts := rr.(*dns.TXT).Txt
+						cause := ""
+						if len(txts) > 0 {
+							cause = txts[0]
+						}
+						return ServerInfo{}, fmt.Errorf("[%s] unexpected record: [%s]", name, cause)
+					}
+				}
+			}
+		}
+	}
+
 	return ServerInfo{
 		Proto:              stamps.StampProtoTypeDNSCrypt,
 		MagicQuery:         certInfo.MagicQuery,
@@ -566,7 +672,7 @@ func dohTestPacket(msgID uint16) []byte {
 	msg.SetEdns0(uint16(MaxDNSPacketSize), false)
 	ext := new(dns.EDNS0_PADDING)
 	ext.Padding = make([]byte, 16)
-	crypto_rand.Read(ext.Padding)
+	_, _ = crypto_rand.Read(ext.Padding)
 	edns0 := msg.IsEdns0()
 	edns0.Option = append(edns0.Option, ext)
 	body, err := msg.Pack()
@@ -589,7 +695,7 @@ func dohNXTestPacket(msgID uint16) []byte {
 	msg.SetEdns0(uint16(MaxDNSPacketSize), false)
 	ext := new(dns.EDNS0_PADDING)
 	ext.Padding = make([]byte, 16)
-	crypto_rand.Read(ext.Padding)
+	_, _ = crypto_rand.Read(ext.Padding)
 	edns0 := msg.IsEdns0()
 	edns0.Option = append(edns0.Option, ext)
 	body, err := msg.Pack()
@@ -597,6 +703,19 @@ func dohNXTestPacket(msgID uint16) []byte {
 		dlog.Fatal(err)
 	}
 	return body
+}
+
+func plainNXTestPacket(msgID uint16) dns.Msg {
+	msg := dns.Msg{}
+	qName := make([]byte, 16)
+	charset := "abcdefghijklmnopqrstuvwxyz"
+	for i := range qName {
+		qName[i] = charset[rand.Intn(len(charset))]
+	}
+	msg.SetQuestion(string(qName)+".test.dnscrypt.", dns.TypeNS)
+	msg.Id = msgID
+	msg.MsgHdr.RecursionDesired = true
+	return msg
 }
 
 func fetchDoHServerInfo(proxy *Proxy, name string, stamp stamps.ServerStamp, isNew bool) (ServerInfo, error) {
@@ -607,7 +726,8 @@ func fetchDoHServerInfo(proxy *Proxy, name string, stamp stamps.ServerStamp, isN
 	if len(stamp.ServerAddrStr) > 0 {
 		ipOnly, _ := ExtractHostAndPort(stamp.ServerAddrStr, -1)
 		if ip := ParseIP(ipOnly); ip != nil {
-			proxy.xTransport.saveCachedIP(stamp.ProviderName, ip, -1*time.Second)
+			host, _ := ExtractHostAndPort(stamp.ProviderName, -1)
+			proxy.xTransport.saveCachedIP(host, ip, -1*time.Second)
 		}
 	}
 	url := &url.URL{
@@ -639,14 +759,14 @@ func fetchDoHServerInfo(proxy *Proxy, name string, stamp stamps.ServerStamp, isN
 		return ServerInfo{}, err
 	}
 	if msg.Rcode != dns.RcodeNameError {
-		dlog.Criticalf("[%s] may be a lying resolver", name)
+		return ServerInfo{}, fmt.Errorf("[%s] may be a lying resolver -- skipping", name)
 	}
 	protocol := tls.NegotiatedProtocol
 	if len(protocol) == 0 {
 		protocol = "http/1.x"
 	}
 	if strings.HasPrefix(protocol, "http/1.") {
-		dlog.Warnf("[%s] does not support HTTP/2", name)
+		dlog.Warnf("[%s] does not support HTTP/2 nor HTTP/3", name)
 	}
 	dlog.Infof("[%s] TLS version: %x - Protocol: %v - Cipher suite: %v", name, tls.Version, protocol, tls.CipherSuite)
 	showCerts := proxy.showCerts
@@ -726,7 +846,10 @@ func _fetchODoHTargetInfo(proxy *Proxy, name string, stamp stamps.ServerStamp, i
 	}
 
 	if relay == nil {
-		dlog.Criticalf("No relay defined for [%v] - Configuring a relay is required for ODoH servers (see the `[anonymized_dns]` section)", name)
+		dlog.Criticalf(
+			"No relay defined for [%v] - Configuring a relay is required for ODoH servers (see the `[anonymized_dns]` section)",
+			name,
+		)
 		return ServerInfo{}, errors.New("No ODoH relay")
 	} else {
 		if relay.ODoH == nil {
@@ -774,7 +897,12 @@ func _fetchODoHTargetInfo(proxy *Proxy, name string, stamp stamps.ServerStamp, i
 			continue
 		}
 
-		responseBody, responseCode, tls, rtt, err := proxy.xTransport.ObliviousDoHQuery(useGet, url, odohQuery.odohMessage, proxy.timeout)
+		responseBody, responseCode, tls, rtt, err := proxy.xTransport.ObliviousDoHQuery(
+			useGet,
+			url,
+			odohQuery.odohMessage,
+			proxy.timeout,
+		)
 		if err != nil {
 			continue
 		}
@@ -794,43 +922,58 @@ func _fetchODoHTargetInfo(proxy *Proxy, name string, stamp stamps.ServerStamp, i
 			return ServerInfo{}, err
 		}
 		if msg.Rcode != dns.RcodeNameError {
-			dlog.Criticalf("[%s] may be a lying resolver", name)
+			return ServerInfo{}, fmt.Errorf("[%s] may be a lying resolver -- skipping", name)
 		}
-
-		protocol := tls.NegotiatedProtocol
-		if len(protocol) == 0 {
-			protocol = "http/1.x"
+		protocol := "http"
+		tlsVersion := uint16(0)
+		tlsCipherSuite := uint16(0)
+		if tls != nil {
+			protocol = tls.NegotiatedProtocol
+			if len(protocol) == 0 {
+				protocol = "http/1.x"
+			} else {
+				tlsVersion = tls.Version
+				tlsCipherSuite = tls.CipherSuite
+			}
 		}
 		if strings.HasPrefix(protocol, "http/1.") {
 			dlog.Warnf("[%s] does not support HTTP/2", name)
 		}
-		dlog.Infof("[%s] TLS version: %x - Protocol: %v - Cipher suite: %v", name, tls.Version, protocol, tls.CipherSuite)
+		dlog.Infof(
+			"[%s] TLS version: %x - Protocol: %v - Cipher suite: %v",
+			name,
+			tlsVersion,
+			protocol,
+			tlsCipherSuite,
+		)
 		showCerts := proxy.showCerts
 		found := false
 		var wantedHash [32]byte
-		for _, cert := range tls.PeerCertificates {
-			h := sha256.Sum256(cert.RawTBSCertificate)
-			if showCerts {
-				dlog.Noticef("Advertised relay cert: [%s] [%x]", cert.Subject, h)
-			} else {
-				dlog.Debugf("Advertised relay cert: [%s] [%x]", cert.Subject, h)
-			}
-			for _, hash := range stamp.Hashes {
-				if len(hash) == len(wantedHash) {
-					copy(wantedHash[:], hash)
-					if h == wantedHash {
-						found = true
-						break
+		if tls != nil {
+			for _, cert := range tls.PeerCertificates {
+				h := sha256.Sum256(cert.RawTBSCertificate)
+				if showCerts {
+					dlog.Noticef("Advertised relay cert: [%s] [%x]", cert.Subject, h)
+				} else {
+					dlog.Debugf("Advertised relay cert: [%s] [%x]", cert.Subject, h)
+				}
+				for _, hash := range stamp.Hashes {
+					if len(hash) == len(wantedHash) {
+						copy(wantedHash[:], hash)
+						if h == wantedHash {
+							found = true
+							break
+						}
 					}
 				}
+				if found {
+					break
+				}
 			}
-			if found {
-				break
+			if !found && len(stamp.Hashes) > 0 {
+				dlog.Criticalf("[%s] Certificate hash [%x] not found", name, wantedHash)
+				return ServerInfo{}, fmt.Errorf("Certificate hash not found")
 			}
-		}
-		if !found && len(stamp.Hashes) > 0 {
-			dlog.Criticalf("[%s] Certificate hash [%x] not found", name, wantedHash)
-			return ServerInfo{}, fmt.Errorf("Certificate hash not found")
 		}
 		if len(serverResponse) < MinDNSPacketSize || len(serverResponse) > MaxDNSPacketSize ||
 			serverResponse[0] != 0xca || serverResponse[1] != 0xfe || serverResponse[4] != 0x00 || serverResponse[5] != 0x01 {

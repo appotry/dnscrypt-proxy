@@ -1,8 +1,9 @@
 package main
 
 import (
+	"encoding/base64"
+	"fmt"
 	"io"
-	"io/ioutil"
 	"net"
 	"net/http"
 	"strings"
@@ -29,30 +30,44 @@ func (handler localDoHHandler) ServeHTTP(writer http.ResponseWriter, request *ht
 		writer.WriteHeader(404)
 		return
 	}
-	if request.Header.Get("Content-Type") != dataType {
+	packet := []byte{}
+	var err error
+	start := time.Now()
+	if request.Method == "POST" &&
+		request.Header.Get("Content-Type") == dataType {
+		packet, err = io.ReadAll(io.LimitReader(request.Body, int64(MaxDNSPacketSize)))
+		if err != nil {
+			dlog.Warnf("No body in a local DoH query")
+			return
+		}
+	} else if request.Method == "GET" && request.Header.Get("Accept") == dataType {
+		encodedPacket := request.URL.Query().Get("dns")
+		if len(encodedPacket) >= MinDNSPacketSize*4/3 && len(encodedPacket) <= MaxDNSPacketSize*4/3 {
+			packet, err = base64.RawURLEncoding.DecodeString(encodedPacket)
+			if err != nil {
+				dlog.Warnf("Invalid base64 in a local DoH query")
+				return
+			}
+		}
+	}
+	if len(packet) < MinDNSPacketSize {
 		writer.Header().Set("Content-Type", "text/plain")
 		writer.WriteHeader(400)
 		writer.Write([]byte("dnscrypt-proxy local DoH server\n"))
 		return
 	}
-	start := time.Now()
 	clientAddr, err := net.ResolveTCPAddr("tcp", request.RemoteAddr)
 	if err != nil {
 		dlog.Errorf("Unable to get the client address: [%v]", err)
 		return
 	}
 	xClientAddr := net.Addr(clientAddr)
-	packet, err := ioutil.ReadAll(io.LimitReader(request.Body, MaxHTTPBodyLength))
-	if err != nil {
-		dlog.Warnf("No body in a local DoH query")
-		return
-	}
 	hasEDNS0Padding, err := hasEDNS0Padding(packet)
 	if err != nil {
 		writer.WriteHeader(400)
 		return
 	}
-	response := proxy.processIncomingQuery("local_doh", proxy.mainProto, packet, &xClientAddr, nil, start)
+	response := proxy.processIncomingQuery("local_doh", proxy.mainProto, packet, &xClientAddr, nil, start, false)
 	if len(response) == 0 {
 		writer.WriteHeader(500)
 		return
@@ -76,6 +91,7 @@ func (handler localDoHHandler) ServeHTTP(writer http.ResponseWriter, request *ht
 		writer.Header().Set("X-Pad", pad)
 	}
 	writer.Header().Set("Content-Type", dataType)
+	writer.Header().Set("Content-Length", fmt.Sprint(len(response)))
 	writer.WriteHeader(200)
 	writer.Write(response)
 }
@@ -97,7 +113,25 @@ func (proxy *Proxy) localDoHListener(acceptPc *net.TCPListener) {
 }
 
 func dohPaddedLen(unpaddedLen int) int {
-	boundaries := [...]int{64, 128, 192, 256, 320, 384, 512, 704, 768, 896, 960, 1024, 1088, 1152, 2688, 4080, MaxDNSPacketSize}
+	boundaries := [...]int{
+		64,
+		128,
+		192,
+		256,
+		320,
+		384,
+		512,
+		704,
+		768,
+		896,
+		960,
+		1024,
+		1088,
+		1152,
+		2688,
+		4080,
+		MaxDNSPacketSize,
+	}
 	for _, boundary := range boundaries {
 		if boundary >= unpaddedLen {
 			return boundary

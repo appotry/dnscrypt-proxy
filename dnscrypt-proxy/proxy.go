@@ -68,9 +68,13 @@ type Proxy struct {
 	nxLogFile                     string
 	proxySecretKey                [32]byte
 	proxyPublicKey                [32]byte
+	ServerNames                   []string
+	DisabledServerNames           []string
+	requiredProps                 stamps.ServerInformalProperties
 	certRefreshDelayAfterFailure  time.Duration
 	timeout                       time.Duration
 	certRefreshDelay              time.Duration
+	certRefreshConcurrency        int
 	cacheSize                     int
 	logMaxBackups                 int
 	logMaxAge                     int
@@ -83,6 +87,7 @@ type Proxy struct {
 	cacheMinTTL                   uint32
 	cacheNegMaxTTL                uint32
 	cloakTTL                      uint32
+	cloakedPTR                    bool
 	cache                         bool
 	pluginBlockIPv6               bool
 	ephemeralKeys                 bool
@@ -93,10 +98,6 @@ type Proxy struct {
 	anonDirectCertFallback        bool
 	pluginBlockUndelegated        bool
 	child                         bool
-	daemonize                     bool
-	requiredProps                 stamps.ServerInformalProperties
-	ServerNames                   []string
-	DisabledServerNames           []string
 	SourceIPv4                    bool
 	SourceIPv6                    bool
 	SourceDNSCrypt                bool
@@ -117,11 +118,18 @@ func (proxy *Proxy) registerLocalDoHListener(listener *net.TCPListener) {
 }
 
 func (proxy *Proxy) addDNSListener(listenAddrStr string) {
-	listenUDPAddr, err := net.ResolveUDPAddr("udp", listenAddrStr)
+	udp := "udp"
+	tcp := "tcp"
+	isIPv4 := isDigit(listenAddrStr[0])
+	if isIPv4 {
+		udp = "udp4"
+		tcp = "tcp4"
+	}
+	listenUDPAddr, err := net.ResolveUDPAddr(udp, listenAddrStr)
 	if err != nil {
 		dlog.Fatal(err)
 	}
-	listenTCPAddr, err := net.ResolveTCPAddr("tcp", listenAddrStr)
+	listenTCPAddr, err := net.ResolveTCPAddr(tcp, listenAddrStr)
 	if err != nil {
 		dlog.Fatal(err)
 	}
@@ -140,11 +148,11 @@ func (proxy *Proxy) addDNSListener(listenAddrStr string) {
 	// if 'userName' is set and we are the parent process
 	if !proxy.child {
 		// parent
-		listenerUDP, err := net.ListenUDP("udp", listenUDPAddr)
+		listenerUDP, err := net.ListenUDP(udp, listenUDPAddr)
 		if err != nil {
 			dlog.Fatal(err)
 		}
-		listenerTCP, err := net.ListenTCP("tcp", listenTCPAddr)
+		listenerTCP, err := net.ListenTCP(tcp, listenTCPAddr)
 		if err != nil {
 			dlog.Fatal(err)
 		}
@@ -185,7 +193,12 @@ func (proxy *Proxy) addDNSListener(listenAddrStr string) {
 }
 
 func (proxy *Proxy) addLocalDoHListener(listenAddrStr string) {
-	listenTCPAddr, err := net.ResolveTCPAddr("tcp", listenAddrStr)
+	network := "tcp"
+	isIPv4 := isDigit(listenAddrStr[0])
+	if isIPv4 {
+		network = "tcp4"
+	}
+	listenTCPAddr, err := net.ResolveTCPAddr(network, listenAddrStr)
 	if err != nil {
 		dlog.Fatal(err)
 	}
@@ -201,7 +214,7 @@ func (proxy *Proxy) addLocalDoHListener(listenAddrStr string) {
 	// if 'userName' is set and we are the parent process
 	if !proxy.child {
 		// parent
-		listenerTCP, err := net.ListenTCP("tcp", listenTCPAddr)
+		listenerTCP, err := net.ListenTCP(network, listenTCPAddr)
 		if err != nil {
 			dlog.Fatal(err)
 		}
@@ -233,6 +246,17 @@ func (proxy *Proxy) StartProxy() {
 	}
 	curve25519.ScalarBaseMult(&proxy.proxyPublicKey, &proxy.proxySecretKey)
 	proxy.startAcceptingClients()
+	if !proxy.child {
+		// Notify the service manager that dnscrypt-proxy is ready. dnscrypt-proxy manages itself in case
+		// servers are not immediately live/reachable. The service manager may assume it is initialized and
+		// functioning properly. Note that the service manager 'Ready' signal is delayed if netprobe
+		// cannot reach the internet during start-up.
+		if err := ServiceManagerReadyNotify(); err != nil {
+			dlog.Fatal(err)
+		}
+	}
+	proxy.xTransport.internalResolverReady = false
+	proxy.xTransport.internalResolvers = proxy.listenAddresses
 	liveServers, err := proxy.serversInfo.refresh(proxy)
 	if liveServers > 0 {
 		proxy.certIgnoreTimestamp = false
@@ -242,11 +266,6 @@ func (proxy *Proxy) StartProxy() {
 	}
 	if liveServers > 0 {
 		dlog.Noticef("dnscrypt-proxy is ready - live servers: %d", liveServers)
-		if !proxy.child {
-			if err := ServiceManagerReadyNotify(); err != nil {
-				dlog.Fatal(err)
-			}
-		}
 	} else if err != nil {
 		dlog.Error(err)
 		dlog.Notice("dnscrypt-proxy is waiting for at least one server to be reachable")
@@ -284,10 +303,16 @@ func (proxy *Proxy) updateRegisteredServers() error {
 				dlog.Criticalf("Unable to use source [%s]: [%s]", source.name, err)
 				return err
 			}
-			dlog.Warnf("Error in source [%s]: [%s] -- Continuing with reduced server count [%d]", source.name, err, len(registeredServers))
+			dlog.Warnf(
+				"Error in source [%s]: [%s] -- Continuing with reduced server count [%d]",
+				source.name,
+				err,
+				len(registeredServers),
+			)
 		}
 		for _, registeredServer := range registeredServers {
-			if registeredServer.stamp.Proto != stamps.StampProtoTypeDNSCryptRelay && registeredServer.stamp.Proto != stamps.StampProtoTypeODoHRelay {
+			if registeredServer.stamp.Proto != stamps.StampProtoTypeDNSCryptRelay &&
+				registeredServer.stamp.Proto != stamps.StampProtoTypeODoHRelay {
 				if len(proxy.ServerNames) > 0 {
 					if !includesName(proxy.ServerNames, registeredServer.name) {
 						continue
@@ -311,13 +336,19 @@ func (proxy *Proxy) updateRegisteredServers() error {
 					continue
 				}
 			}
-			if registeredServer.stamp.Proto == stamps.StampProtoTypeDNSCryptRelay || registeredServer.stamp.Proto == stamps.StampProtoTypeODoHRelay {
+			if registeredServer.stamp.Proto == stamps.StampProtoTypeDNSCryptRelay ||
+				registeredServer.stamp.Proto == stamps.StampProtoTypeODoHRelay {
 				var found bool
 				for i, currentRegisteredRelay := range proxy.registeredRelays {
 					if currentRegisteredRelay.name == registeredServer.name {
 						found = true
 						if currentRegisteredRelay.stamp.String() != registeredServer.stamp.String() {
-							dlog.Infof("Updating stamp for [%s] was: %s now: %s", registeredServer.name, currentRegisteredRelay.stamp.String(), registeredServer.stamp.String())
+							dlog.Infof(
+								"Updating stamp for [%s] was: %s now: %s",
+								registeredServer.name,
+								currentRegisteredRelay.stamp.String(),
+								registeredServer.stamp.String(),
+							)
 							proxy.registeredRelays[i].stamp = registeredServer.stamp
 							dlog.Debugf("Total count of registered relays %v", len(proxy.registeredRelays))
 						}
@@ -369,14 +400,22 @@ func (proxy *Proxy) udpListener(clientPc *net.UDPConn) {
 			return
 		}
 		packet := buffer[:length]
+		if !proxy.clientsCountInc() {
+			dlog.Warnf("Too many incoming connections (max=%d)", proxy.maxClients)
+			proxy.processIncomingQuery(
+				"udp",
+				proxy.mainProto,
+				packet,
+				&clientAddr,
+				clientPc,
+				time.Now(),
+				true,
+			) // respond synchronously, but only to cached/synthesized queries
+			continue
+		}
 		go func() {
-			start := time.Now()
-			if !proxy.clientsCountInc() {
-				dlog.Warnf("Too many incoming connections (max=%d)", proxy.maxClients)
-				return
-			}
 			defer proxy.clientsCountDec()
-			proxy.processIncomingQuery("udp", proxy.mainProto, packet, &clientAddr, clientPc, start)
+			proxy.processIncomingQuery("udp", proxy.mainProto, packet, &clientAddr, clientPc, time.Now(), false)
 		}()
 	}
 }
@@ -388,23 +427,24 @@ func (proxy *Proxy) tcpListener(acceptPc *net.TCPListener) {
 		if err != nil {
 			continue
 		}
+		if !proxy.clientsCountInc() {
+			dlog.Warnf("Too many incoming connections (max=%d)", proxy.maxClients)
+			clientPc.Close()
+			continue
+		}
 		go func() {
-			start := time.Now()
 			defer clientPc.Close()
-			if !proxy.clientsCountInc() {
-				dlog.Warnf("Too many incoming connections (max=%d)", proxy.maxClients)
-				return
-			}
 			defer proxy.clientsCountDec()
 			if err := clientPc.SetDeadline(time.Now().Add(proxy.timeout)); err != nil {
 				return
 			}
+			start := time.Now()
 			packet, err := ReadPrefixed(&clientPc)
 			if err != nil {
 				return
 			}
 			clientAddr := clientPc.RemoteAddr()
-			proxy.processIncomingQuery("tcp", "tcp", packet, &clientAddr, clientPc, start)
+			proxy.processIncomingQuery("tcp", "tcp", packet, &clientAddr, clientPc, start, false)
 		}()
 	}
 }
@@ -414,7 +454,13 @@ func (proxy *Proxy) udpListenerFromAddr(listenAddr *net.UDPAddr) error {
 	if err != nil {
 		return err
 	}
-	clientPc, err := listenConfig.ListenPacket(context.Background(), "udp", listenAddr.String())
+	listenAddrStr := listenAddr.String()
+	network := "udp"
+	isIPv4 := isDigit(listenAddrStr[0])
+	if isIPv4 {
+		network = "udp4"
+	}
+	clientPc, err := listenConfig.ListenPacket(context.Background(), network, listenAddrStr)
 	if err != nil {
 		return err
 	}
@@ -428,7 +474,13 @@ func (proxy *Proxy) tcpListenerFromAddr(listenAddr *net.TCPAddr) error {
 	if err != nil {
 		return err
 	}
-	acceptPc, err := listenConfig.Listen(context.Background(), "tcp", listenAddr.String())
+	listenAddrStr := listenAddr.String()
+	network := "tcp"
+	isIPv4 := isDigit(listenAddrStr[0])
+	if isIPv4 {
+		network = "tcp4"
+	}
+	acceptPc, err := listenConfig.Listen(context.Background(), network, listenAddrStr)
 	if err != nil {
 		return err
 	}
@@ -442,7 +494,13 @@ func (proxy *Proxy) localDoHListenerFromAddr(listenAddr *net.TCPAddr) error {
 	if err != nil {
 		return err
 	}
-	acceptPc, err := listenConfig.Listen(context.Background(), "tcp", listenAddr.String())
+	listenAddrStr := listenAddr.String()
+	network := "tcp"
+	isIPv4 := isDigit(listenAddrStr[0])
+	if isIPv4 {
+		network = "tcp4"
+	}
+	acceptPc, err := listenConfig.Listen(context.Background(), network, listenAddrStr)
 	if err != nil {
 		return err
 	}
@@ -476,7 +534,12 @@ func (proxy *Proxy) prepareForRelay(ip net.IP, port int, encryptedQuery *[]byte)
 	*encryptedQuery = relayedQuery
 }
 
-func (proxy *Proxy) exchangeWithUDPServer(serverInfo *ServerInfo, sharedKey *[32]byte, encryptedQuery []byte, clientNonce []byte) ([]byte, error) {
+func (proxy *Proxy) exchangeWithUDPServer(
+	serverInfo *ServerInfo,
+	sharedKey *[32]byte,
+	encryptedQuery []byte,
+	clientNonce []byte,
+) ([]byte, error) {
 	upstreamAddr := serverInfo.UDPAddr
 	if serverInfo.Relay != nil && serverInfo.Relay.Dnscrypt != nil {
 		upstreamAddr = serverInfo.Relay.Dnscrypt.RelayUDPAddr
@@ -485,7 +548,7 @@ func (proxy *Proxy) exchangeWithUDPServer(serverInfo *ServerInfo, sharedKey *[32
 	var pc net.Conn
 	proxyDialer := proxy.xTransport.proxyDialer
 	if proxyDialer == nil {
-		pc, err = net.DialUDP("udp", nil, upstreamAddr)
+		pc, err = net.DialTimeout("udp", upstreamAddr.String(), serverInfo.Timeout)
 	} else {
 		pc, err = (*proxyDialer).Dial("udp", upstreamAddr.String())
 	}
@@ -514,7 +577,12 @@ func (proxy *Proxy) exchangeWithUDPServer(serverInfo *ServerInfo, sharedKey *[32
 	return proxy.Decrypt(serverInfo, sharedKey, encryptedResponse, clientNonce)
 }
 
-func (proxy *Proxy) exchangeWithTCPServer(serverInfo *ServerInfo, sharedKey *[32]byte, encryptedQuery []byte, clientNonce []byte) ([]byte, error) {
+func (proxy *Proxy) exchangeWithTCPServer(
+	serverInfo *ServerInfo,
+	sharedKey *[32]byte,
+	encryptedQuery []byte,
+	clientNonce []byte,
+) ([]byte, error) {
 	upstreamAddr := serverInfo.TCPAddr
 	if serverInfo.Relay != nil && serverInfo.Relay.Dnscrypt != nil {
 		upstreamAddr = serverInfo.Relay.Dnscrypt.RelayTCPAddr
@@ -523,7 +591,7 @@ func (proxy *Proxy) exchangeWithTCPServer(serverInfo *ServerInfo, sharedKey *[32
 	var pc net.Conn
 	proxyDialer := proxy.xTransport.proxyDialer
 	if proxyDialer == nil {
-		pc, err = net.DialTCP("tcp", nil, upstreamAddr)
+		pc, err = net.DialTimeout("tcp", upstreamAddr.String(), serverInfo.Timeout)
 	} else {
 		pc, err = (*proxyDialer).Dial("tcp", upstreamAddr.String())
 	}
@@ -566,15 +634,25 @@ func (proxy *Proxy) clientsCountInc() bool {
 
 func (proxy *Proxy) clientsCountDec() {
 	for {
-		if count := atomic.LoadUint32(&proxy.clientsCount); count == 0 || atomic.CompareAndSwapUint32(&proxy.clientsCount, count, count-1) {
+		if count := atomic.LoadUint32(&proxy.clientsCount); count == 0 ||
+			atomic.CompareAndSwapUint32(&proxy.clientsCount, count, count-1) {
 			break
 		}
 	}
 }
 
-func (proxy *Proxy) processIncomingQuery(clientProto string, serverProto string, query []byte, clientAddr *net.Addr, clientPc net.Conn, start time.Time) (response []byte) {
+func (proxy *Proxy) processIncomingQuery(
+	clientProto string,
+	serverProto string,
+	query []byte,
+	clientAddr *net.Addr,
+	clientPc net.Conn,
+	start time.Time,
+	onlyCached bool,
+) []byte {
+	var response []byte
 	if len(query) < MinDNSPacketSize {
-		return
+		return response
 	}
 	pluginsState := NewPluginsState(proxy, clientProto, clientAddr, serverProto, start)
 	serverName := "-"
@@ -586,12 +664,12 @@ func (proxy *Proxy) processIncomingQuery(clientProto string, serverProto string,
 	}
 	query, _ = pluginsState.ApplyQueryPlugins(&proxy.pluginsGlobals, query, needsEDNS0Padding)
 	if len(query) < MinDNSPacketSize || len(query) > MaxDNSPacketSize {
-		return
+		return response
 	}
 	if pluginsState.action == PluginsActionDrop {
 		pluginsState.returnCode = PluginsReturnCodeDrop
 		pluginsState.ApplyLoggingPlugins(&proxy.pluginsGlobals)
-		return
+		return response
 	}
 	var err error
 	if pluginsState.synthResponse != nil {
@@ -599,8 +677,14 @@ func (proxy *Proxy) processIncomingQuery(clientProto string, serverProto string,
 		if err != nil {
 			pluginsState.returnCode = PluginsReturnCodeParseError
 			pluginsState.ApplyLoggingPlugins(&proxy.pluginsGlobals)
-			return
+			return response
 		}
+	}
+	if onlyCached {
+		if len(response) == 0 {
+			return response
+		}
+		serverInfo = nil
 	}
 	if len(response) == 0 && serverInfo != nil {
 		var ttl *uint32
@@ -615,7 +699,7 @@ func (proxy *Proxy) processIncomingQuery(clientProto string, serverProto string,
 			if err != nil {
 				pluginsState.returnCode = PluginsReturnCodeParseError
 				pluginsState.ApplyLoggingPlugins(&proxy.pluginsGlobals)
-				return
+				return response
 			}
 			serverInfo.noticeBegin(proxy)
 			if serverProto == "udp" {
@@ -633,7 +717,7 @@ func (proxy *Proxy) processIncomingQuery(clientProto string, serverProto string,
 					if err != nil {
 						pluginsState.returnCode = PluginsReturnCodeParseError
 						pluginsState.ApplyLoggingPlugins(&proxy.pluginsGlobals)
-						return
+						return response
 					}
 					response, err = proxy.exchangeWithTCPServer(serverInfo, sharedKey, encryptedQuery, clientNonce)
 				}
@@ -654,7 +738,7 @@ func (proxy *Proxy) processIncomingQuery(clientProto string, serverProto string,
 				}
 				pluginsState.ApplyLoggingPlugins(&proxy.pluginsGlobals)
 				serverInfo.noticeFailure(proxy)
-				return
+				return response
 			}
 		} else if serverInfo.Proto == stamps.StampProtoTypeDoH {
 			tid := TransactionID(query)
@@ -662,17 +746,18 @@ func (proxy *Proxy) processIncomingQuery(clientProto string, serverProto string,
 			serverInfo.noticeBegin(proxy)
 			serverResponse, _, tls, _, err := proxy.xTransport.DoHQuery(serverInfo.useGet, serverInfo.URL, query, proxy.timeout)
 			SetTransactionID(query, tid)
-			if err == nil || tls == nil || !tls.HandshakeComplete {
-				response = nil
-			} else if stale, ok := pluginsState.sessionData["stale"]; ok {
-				dlog.Debug("Serving stale response")
-				response, err = (stale.(*dns.Msg)).Pack()
+
+			if err != nil || tls == nil || !tls.HandshakeComplete {
+				if stale, ok := pluginsState.sessionData["stale"]; ok {
+					dlog.Debug("Serving stale response")
+					response, err = (stale.(*dns.Msg)).Pack()
+				}
 			}
 			if err != nil {
 				pluginsState.returnCode = PluginsReturnCodeNetworkError
 				pluginsState.ApplyLoggingPlugins(&proxy.pluginsGlobals)
 				serverInfo.noticeFailure(proxy)
-				return
+				return response
 			}
 			if response == nil {
 				response = serverResponse
@@ -683,7 +768,7 @@ func (proxy *Proxy) processIncomingQuery(clientProto string, serverProto string,
 		} else if serverInfo.Proto == stamps.StampProtoTypeODoHTarget {
 			tid := TransactionID(query)
 			if len(serverInfo.odohTargetConfigs) == 0 {
-				return
+				return response
 			}
 			target := serverInfo.odohTargetConfigs[rand.Intn(len(serverInfo.odohTargetConfigs))]
 			odohQuery, err := target.encryptQuery(query)
@@ -702,7 +787,10 @@ func (proxy *Proxy) processIncomingQuery(clientProto string, serverProto string,
 						dlog.Warnf("Failed to decrypt response from [%v]", serverName)
 						response = nil
 					}
-				} else if responseCode == 401 {
+				} else if responseCode == 401 || (responseCode == 200 && len(responseBody) == 0) {
+					if responseCode == 200 {
+						dlog.Warnf("ODoH relay for [%v] is buggy and returns a 200 status code instead of 401 after a key update", serverInfo.Name)
+					}
 					dlog.Infof("Forcing key update for [%v]", serverInfo.Name)
 					for _, registeredServer := range proxy.serversInfo.registeredServers {
 						if registeredServer.name == serverInfo.Name {
@@ -710,6 +798,7 @@ func (proxy *Proxy) processIncomingQuery(clientProto string, serverProto string,
 								// Failed to refresh the proxy server information.
 								dlog.Noticef("Key update failed for [%v]", serverName)
 								serverInfo.noticeFailure(proxy)
+								clocksmith.Sleep(10 * time.Second)
 							}
 							break
 						}
@@ -726,7 +815,7 @@ func (proxy *Proxy) processIncomingQuery(clientProto string, serverProto string,
 				pluginsState.returnCode = PluginsReturnCodeNetworkError
 				pluginsState.ApplyLoggingPlugins(&proxy.pluginsGlobals)
 				serverInfo.noticeFailure(proxy)
-				return
+				return response
 			}
 		} else {
 			dlog.Fatal("Unsupported protocol")
@@ -735,33 +824,33 @@ func (proxy *Proxy) processIncomingQuery(clientProto string, serverProto string,
 			pluginsState.returnCode = PluginsReturnCodeParseError
 			pluginsState.ApplyLoggingPlugins(&proxy.pluginsGlobals)
 			serverInfo.noticeFailure(proxy)
-			return
+			return response
 		}
 		response, err = pluginsState.ApplyResponsePlugins(&proxy.pluginsGlobals, response, ttl)
 		if err != nil {
 			pluginsState.returnCode = PluginsReturnCodeParseError
 			pluginsState.ApplyLoggingPlugins(&proxy.pluginsGlobals)
 			serverInfo.noticeFailure(proxy)
-			return
+			return response
 		}
 		if pluginsState.action == PluginsActionDrop {
 			pluginsState.returnCode = PluginsReturnCodeDrop
 			pluginsState.ApplyLoggingPlugins(&proxy.pluginsGlobals)
-			return
+			return response
 		}
 		if pluginsState.synthResponse != nil {
 			response, err = pluginsState.synthResponse.PackBuffer(response)
 			if err != nil {
 				pluginsState.returnCode = PluginsReturnCodeParseError
 				pluginsState.ApplyLoggingPlugins(&proxy.pluginsGlobals)
-				return
+				return response
 			}
 		}
 		if rcode := Rcode(response); rcode == dns.RcodeServerFailure { // SERVFAIL
 			if pluginsState.dnssec {
 				dlog.Debug("A response had an invalid DNSSEC signature")
 			} else {
-				dlog.Infof("Server [%v] returned temporary error code SERVFAIL -- Invalid DNSSEC signature received or server may be experiencing connectivity issues", serverInfo.Name)
+				dlog.Infof("A response with status code 2 was received - this is usually a temporary, remote issue with the configuration of the domain name")
 				serverInfo.noticeFailure(proxy)
 			}
 		} else {
@@ -778,7 +867,7 @@ func (proxy *Proxy) processIncomingQuery(clientProto string, serverProto string,
 		if serverInfo != nil {
 			serverInfo.noticeFailure(proxy)
 		}
-		return
+		return response
 	}
 	if clientProto == "udp" {
 		if len(response) > pluginsState.maxUnencryptedUDPSafePayloadSize {
@@ -786,7 +875,7 @@ func (proxy *Proxy) processIncomingQuery(clientProto string, serverProto string,
 			if err != nil {
 				pluginsState.returnCode = PluginsReturnCodeParseError
 				pluginsState.ApplyLoggingPlugins(&proxy.pluginsGlobals)
-				return
+				return response
 			}
 		}
 		clientPc.(net.PacketConn).WriteTo(response, *clientAddr)
@@ -803,7 +892,7 @@ func (proxy *Proxy) processIncomingQuery(clientProto string, serverProto string,
 			if serverInfo != nil {
 				serverInfo.noticeFailure(proxy)
 			}
-			return
+			return response
 		}
 		if clientPc != nil {
 			clientPc.Write(response)

@@ -1,4 +1,4 @@
-// +build !android
+//go:build !android
 
 package main
 
@@ -7,13 +7,15 @@ import (
 	clocksmith "github.com/jedisct1/go-clocksmith"
 )
 
+const SdNotifyStatus = "STATUS="
+
 func ServiceManagerStartNotify() error {
-	daemon.SdNotify(false, "STATUS=Starting")
+	daemon.SdNotify(false, SdNotifyStatus+"Starting...")
 	return nil
 }
 
 func ServiceManagerReadyNotify() error {
-	daemon.SdNotify(false, "READY=1")
+	daemon.SdNotify(false, daemon.SdNotifyReady+"\n"+SdNotifyStatus+"Ready")
 	return systemDWatchdog()
 }
 
@@ -25,10 +27,9 @@ func systemDWatchdog() error {
 	refreshInterval := watchdogFailureDelay / 3
 	go func() {
 		for {
-			daemon.SdNotify(false, "WATCHDOG=1")
+			daemon.SdNotify(false, daemon.SdNotifyWatchdog)
 			clocksmith.Sleep(refreshInterval)
 		}
-
 	}()
 	return nil
 }

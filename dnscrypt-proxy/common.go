@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
-	"io/ioutil"
 	"net"
 	"os"
+	"path"
 	"strconv"
 	"strings"
 	"unicode"
+
+	"github.com/jedisct1/dlog"
 )
 
 type CryptoConstruction uint16
@@ -96,20 +98,6 @@ func Max(a, b int) int {
 	return b
 }
 
-func MinF(a, b float64) float64 {
-	if a < b {
-		return a
-	}
-	return b
-}
-
-func MaxF(a, b float64) float64 {
-	if a > b {
-		return a
-	}
-	return b
-}
-
 func StringReverse(s string) string {
 	r := []rune(s)
 	for i, j := 0, len(r)-1; i < len(r)/2; i, j = i+1, j-1 {
@@ -170,10 +158,40 @@ func ExtractHostAndPort(str string, defaultPort int) (host string, port int) {
 }
 
 func ReadTextFile(filename string) (string, error) {
-	bin, err := ioutil.ReadFile(filename)
+	bin, err := os.ReadFile(filename)
 	if err != nil {
 		return "", err
 	}
 	bin = bytes.TrimPrefix(bin, []byte{0xef, 0xbb, 0xbf})
 	return string(bin), nil
+}
+
+func isDigit(b byte) bool { return b >= '0' && b <= '9' }
+
+func maybeWritableByOtherUsers(p string) (bool, string, error) {
+	p = path.Clean(p)
+	for p != "/" && p != "." {
+		st, err := os.Stat(p)
+		if err != nil {
+			return false, p, err
+		}
+		mode := st.Mode()
+		if mode.Perm()&2 != 0 && !(st.IsDir() && mode&os.ModeSticky == os.ModeSticky) {
+			return true, p, nil
+		}
+		p = path.Dir(p)
+	}
+	return false, "", nil
+}
+
+func WarnIfMaybeWritableByOtherUsers(p string) {
+	if ok, px, err := maybeWritableByOtherUsers(p); ok {
+		if px == p {
+			dlog.Criticalf("[%s] is writable by other system users - If this is not intentional, it is recommended to fix the access permissions", p)
+		} else {
+			dlog.Warnf("[%s] can be modified by other system users because [%s] is writable by other users - If this is not intentional, it is recommended to fix the access permissions", p, px)
+		}
+	} else if err != nil {
+		dlog.Warnf("Error while checking if [%s] is accessible: [%s] : [%s]", p, px, err)
+	}
 }

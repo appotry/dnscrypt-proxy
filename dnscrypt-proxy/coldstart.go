@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/jedisct1/dlog"
@@ -15,14 +16,13 @@ type CaptivePortalEntryIPs []net.IP
 type CaptivePortalMap map[string]CaptivePortalEntryIPs
 
 type CaptivePortalHandler struct {
-	cancelChannels []chan struct{}
+	wg            sync.WaitGroup
+	cancelChannel chan struct{}
 }
 
 func (captivePortalHandler *CaptivePortalHandler) Stop() {
-	for _, cancelChannel := range captivePortalHandler.cancelChannels {
-		cancelChannel <- struct{}{}
-		<-cancelChannel
-	}
+	close(captivePortalHandler.cancelChannel)
+	captivePortalHandler.wg.Wait()
 }
 
 func (ipsMap *CaptivePortalMap) GetEntry(msg *dns.Msg) (*dns.Question, *CaptivePortalEntryIPs) {
@@ -116,20 +116,30 @@ func handleColdStartClient(clientPc *net.UDPConn, cancelChannel chan struct{}, i
 	return false
 }
 
-func addColdStartListener(proxy *Proxy, ipsMap *CaptivePortalMap, listenAddrStr string, cancelChannel chan struct{}) error {
-	listenUDPAddr, err := net.ResolveUDPAddr("udp", listenAddrStr)
+func addColdStartListener(
+	ipsMap *CaptivePortalMap,
+	listenAddrStr string,
+	captivePortalHandler *CaptivePortalHandler,
+) error {
+	network := "udp"
+	isIPv4 := isDigit(listenAddrStr[0])
+	if isIPv4 {
+		network = "udp4"
+	}
+	listenUDPAddr, err := net.ResolveUDPAddr(network, listenAddrStr)
 	if err != nil {
 		return err
 	}
-	clientPc, err := net.ListenUDP("udp", listenUDPAddr)
+	clientPc, err := net.ListenUDP(network, listenUDPAddr)
 	if err != nil {
 		return err
 	}
+	captivePortalHandler.wg.Add(1)
 	go func() {
-		for !handleColdStartClient(clientPc, cancelChannel, ipsMap) {
+		for !handleColdStartClient(clientPc, captivePortalHandler.cancelChannel, ipsMap) {
 		}
 		clientPc.Close()
-		cancelChannel <- struct{}{}
+		captivePortalHandler.wg.Done()
 	}()
 	return nil
 }
@@ -138,13 +148,13 @@ func ColdStart(proxy *Proxy) (*CaptivePortalHandler, error) {
 	if len(proxy.captivePortalMapFile) == 0 {
 		return nil, nil
 	}
-	bin, err := ReadTextFile(proxy.captivePortalMapFile)
+	lines, err := ReadTextFile(proxy.captivePortalMapFile)
 	if err != nil {
 		dlog.Warn(err)
 		return nil, err
 	}
 	ipsMap := make(CaptivePortalMap)
-	for lineNo, line := range strings.Split(string(bin), "\n") {
+	for lineNo, line := range strings.Split(lines, "\n") {
 		line = TrimAndStripInlineComments(line)
 		if len(line) == 0 {
 			continue
@@ -159,6 +169,12 @@ func ColdStart(proxy *Proxy) (*CaptivePortalHandler, error) {
 		name, err = NormalizeQName(name)
 		if err != nil {
 			continue
+		}
+		if strings.Contains(ipsStr, "*") {
+			return nil, fmt.Errorf(
+				"A captive portal rule must use an exact host name at line %d",
+				1+lineNo,
+			)
 		}
 		var ips []net.IP
 		for _, ip := range strings.Split(ipsStr, ",") {
@@ -175,16 +191,19 @@ func ColdStart(proxy *Proxy) (*CaptivePortalHandler, error) {
 		ipsMap[name] = ips
 	}
 	listenAddrStrs := proxy.listenAddresses
-	cancelChannels := make([]chan struct{}, 0)
+	captivePortalHandler := CaptivePortalHandler{
+		cancelChannel: make(chan struct{}),
+	}
+	ok := false
 	for _, listenAddrStr := range listenAddrStrs {
-		cancelChannel := make(chan struct{})
-		if err := addColdStartListener(proxy, &ipsMap, listenAddrStr, cancelChannel); err == nil {
-			cancelChannels = append(cancelChannels, cancelChannel)
+		err = addColdStartListener(&ipsMap, listenAddrStr, &captivePortalHandler)
+		if err == nil {
+			ok = true
 		}
 	}
-	captivePortalHandler := CaptivePortalHandler{
-		cancelChannels: cancelChannels,
+	if ok {
+		err = nil
 	}
 	proxy.captivePortalMap = &ipsMap
-	return &captivePortalHandler, nil
+	return &captivePortalHandler, err
 }

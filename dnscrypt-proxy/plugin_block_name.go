@@ -44,10 +44,14 @@ func (blockedNames *BlockedNames) check(pluginsState *PluginsState, qName string
 	pluginsState.returnCode = PluginsReturnCodeReject
 	if blockedNames.logger != nil {
 		var clientIPStr string
-		if pluginsState.clientProto == "udp" {
+		switch pluginsState.clientProto {
+		case "udp":
 			clientIPStr = (*pluginsState.clientAddr).(*net.UDPAddr).IP.String()
-		} else {
+		case "tcp", "local_doh":
 			clientIPStr = (*pluginsState.clientAddr).(*net.TCPAddr).IP.String()
+		default:
+			// Ignore internal flow.
+			return false, nil
 		}
 		var line string
 		if blockedNames.format == "tsv" {
@@ -71,8 +75,7 @@ func (blockedNames *BlockedNames) check(pluginsState *PluginsState, qName string
 
 // ---
 
-type PluginBlockName struct {
-}
+type PluginBlockName struct{}
 
 func (plugin *PluginBlockName) Name() string {
 	return "block_name"
@@ -84,7 +87,7 @@ func (plugin *PluginBlockName) Description() string {
 
 func (plugin *PluginBlockName) Init(proxy *Proxy) error {
 	dlog.Noticef("Loading the set of blocking rules from [%s]", proxy.blockNameFile)
-	bin, err := ReadTextFile(proxy.blockNameFile)
+	lines, err := ReadTextFile(proxy.blockNameFile)
 	if err != nil {
 		return err
 	}
@@ -92,22 +95,18 @@ func (plugin *PluginBlockName) Init(proxy *Proxy) error {
 		allWeeklyRanges: proxy.allWeeklyRanges,
 		patternMatcher:  NewPatternMatcher(),
 	}
-	for lineNo, line := range strings.Split(string(bin), "\n") {
+	for lineNo, line := range strings.Split(lines, "\n") {
 		line = TrimAndStripInlineComments(line)
 		if len(line) == 0 {
 			continue
 		}
-		parts := strings.Fields(line)
+		parts := strings.Split(line, "@")
 		timeRangeName := ""
 		if len(parts) == 2 {
-			if timeRangeParts := strings.Split(parts[1], "@"); len(timeRangeParts) == 2 {
-				timeRangeName = strings.TrimSpace(timeRangeParts[1])
-			} else {
-				dlog.Errorf("Syntax error in block rules at line %d", 1+lineNo)
-				continue
-			}
+			line = strings.TrimSpace(parts[0])
+			timeRangeName = strings.TrimSpace(parts[1])
 		} else if len(parts) > 2 {
-			dlog.Errorf("Syntax error in block rules at line %d", 1+lineNo)
+			dlog.Errorf("Syntax error in block rules at line %d -- Unexpected @ character", 1+lineNo)
 			continue
 		}
 		var weeklyRanges *WeeklyRanges
@@ -152,8 +151,7 @@ func (plugin *PluginBlockName) Eval(pluginsState *PluginsState, msg *dns.Msg) er
 
 // ---
 
-type PluginBlockNameResponse struct {
-}
+type PluginBlockNameResponse struct{}
 
 func (plugin *PluginBlockNameResponse) Name() string {
 	return "block_name"

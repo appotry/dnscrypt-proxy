@@ -20,12 +20,22 @@ type CertInfo struct {
 	ForwardSecurity    bool
 }
 
-func FetchCurrentDNSCryptCert(proxy *Proxy, serverName *string, proto string, pk ed25519.PublicKey, serverAddress string, providerName string, isNew bool, relay *DNSCryptRelay, knownBugs ServerBugs) (CertInfo, int, bool, error) {
+func FetchCurrentDNSCryptCert(
+	proxy *Proxy,
+	serverName *string,
+	proto string,
+	pk ed25519.PublicKey,
+	serverAddress string,
+	providerName string,
+	isNew bool,
+	relay *DNSCryptRelay,
+	knownBugs ServerBugs,
+) (CertInfo, int, bool, error) {
 	if len(pk) != ed25519.PublicKeySize {
 		return CertInfo{}, 0, false, errors.New("Invalid public key length")
 	}
 	if !strings.HasSuffix(providerName, ".") {
-		providerName = providerName + "."
+		providerName += "."
 	}
 	if serverName == nil {
 		serverName = &providerName
@@ -34,7 +44,11 @@ func FetchCurrentDNSCryptCert(proxy *Proxy, serverName *string, proto string, pk
 	query.SetQuestion(providerName, dns.TypeTXT)
 	if !strings.HasPrefix(providerName, "2.dnscrypt-cert.") {
 		if relay != nil && !proxy.anonDirectCertFallback {
-			dlog.Warnf("[%v] uses a non-standard provider name, enable direct cert fallback to use with a relay ('%v' doesn't start with '2.dnscrypt-cert.')", *serverName, providerName)
+			dlog.Warnf(
+				"[%v] uses a non-standard provider name, enable direct cert fallback to use with a relay ('%v' doesn't start with '2.dnscrypt-cert.')",
+				*serverName,
+				providerName,
+			)
 		} else {
 			dlog.Warnf("[%v] uses a non-standard provider name ('%v' doesn't start with '2.dnscrypt-cert.')", *serverName, providerName)
 			relay = nil
@@ -44,7 +58,15 @@ func FetchCurrentDNSCryptCert(proxy *Proxy, serverName *string, proto string, pk
 	if knownBugs.fragmentsBlocked {
 		tryFragmentsSupport = false
 	}
-	in, rtt, fragmentsBlocked, err := DNSExchange(proxy, proto, &query, serverAddress, relay, serverName, tryFragmentsSupport)
+	in, rtt, fragmentsBlocked, err := DNSExchange(
+		proxy,
+		proto,
+		&query,
+		serverAddress,
+		relay,
+		serverName,
+		tryFragmentsSupport,
+	)
 	if err != nil {
 		dlog.Noticef("[%s] TIMEOUT", *serverName)
 		return CertInfo{}, 0, fragmentsBlocked, err
@@ -74,10 +96,11 @@ func FetchCurrentDNSCryptCert(proxy *Proxy, serverName *string, proto string, pk
 		switch esVersion := binary.BigEndian.Uint16(binCert[4:6]); esVersion {
 		case 0x0001:
 			cryptoConstruction = XSalsa20Poly1305
+			dlog.Noticef("[%v] should upgrade to XChaCha20 for encryption", *serverName)
 		case 0x0002:
 			cryptoConstruction = XChacha20Poly1305
 		default:
-			dlog.Noticef("[%v] Unsupported crypto construction", *serverName)
+			dlog.Debugf("[%v] uses an unsupported encryption system", *serverName)
 			continue
 		}
 		signature := binCert[8:72]
@@ -95,10 +118,17 @@ func FetchCurrentDNSCryptCert(proxy *Proxy, serverName *string, proto string, pk
 		}
 		ttl := tsEnd - tsBegin
 		if ttl > 86400*7 {
-			dlog.Infof("[%v] the key validity period for this server is excessively long (%d days), significantly reducing reliability and forward security.", *serverName, ttl/86400)
+			dlog.Infof(
+				"[%v] the key validity period for this server is excessively long (%d days), significantly reducing reliability and forward security.",
+				*serverName,
+				ttl/86400,
+			)
 			daysLeft := (tsEnd - now) / 86400
 			if daysLeft < 1 {
-				dlog.Criticalf("[%v] certificate will expire today -- Switch to a different resolver as soon as possible", *serverName)
+				dlog.Criticalf(
+					"[%v] certificate will expire today -- Switch to a different resolver as soon as possible",
+					*serverName,
+				)
 			} else if daysLeft <= 7 {
 				dlog.Warnf("[%v] certificate is about to expire -- if you don't manage this server, tell the server operator about it", *serverName)
 			} else if daysLeft <= 30 {
@@ -112,7 +142,13 @@ func FetchCurrentDNSCryptCert(proxy *Proxy, serverName *string, proto string, pk
 		}
 		if !proxy.certIgnoreTimestamp {
 			if now > tsEnd || now < tsBegin {
-				dlog.Debugf("[%v] Certificate not valid at the current date (now: %v is not in [%v..%v])", *serverName, now, tsBegin, tsEnd)
+				dlog.Debugf(
+					"[%v] Certificate not valid at the current date (now: %v is not in [%v..%v])",
+					*serverName,
+					now,
+					tsBegin,
+					tsEnd,
+				)
 				continue
 			}
 		}
@@ -148,7 +184,7 @@ func FetchCurrentDNSCryptCert(proxy *Proxy, serverName *string, proto string, pk
 		certCountStr = " - additional certificate"
 	}
 	if certInfo.CryptoConstruction == UndefinedConstruction {
-		return certInfo, 0, fragmentsBlocked, errors.New("No useable certificate found")
+		return certInfo, 0, fragmentsBlocked, errors.New("No usable certificate found")
 	}
 	return certInfo, int(rtt.Nanoseconds() / 1000000), fragmentsBlocked, nil
 }
